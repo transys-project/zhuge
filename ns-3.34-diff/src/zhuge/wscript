@@ -1,0 +1,21 @@
+## -*- Mode: python; py-indent-offset: 4; indent-tabs-mode: nil; coding: utf-8; -*-
+
+def build(bld):
+    module = bld.create_ns3_module('zhuge', ['internet', 'network'])
+    module.source = [
+        'model/network-queue-zhuge.cc',
+        'model/network-queue-abc.cc',
+        'model/network-queue-fastack.cc',
+        'model/network-queue.cc',
+        'model/delta-delay.cc'
+        ]
+
+    headers = bld(features='ns3header')
+    headers.module = 'zhuge'
+    headers.source = [
+        'model/network-queue-zhuge.h',
+        'model/network-queue-abc.h',
+        'model/network-queue-fastack.h',
+        'model/network-queue.h',
+        'model/delta-delay.h'
+        ]

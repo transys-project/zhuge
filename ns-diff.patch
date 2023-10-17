@@ -1,0 +1,1618 @@
+diff -ruN ns-3.34/src/internet/model/ipv4-header.cc ns-3.34/src/internet/model/ipv4-header.cc
+--- ns-3.34/src/internet/model/ipv4-header.cc	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/ipv4-header.cc	2023-10-17 16:22:07.930912209 +0800
+@@ -45,6 +45,46 @@
+ {
+ }
+ 
++Ipv4Header::Ipv4Header (const Ipv4Header &hdr)
++  : m_calcChecksum (hdr.m_calcChecksum),
++    m_payloadSize (hdr.m_payloadSize),
++    m_identification (hdr.m_identification),
++    m_tos (hdr.m_tos),
++    m_ttl (hdr.m_ttl),
++    m_protocol (hdr.m_protocol),
++    m_flags (hdr.m_flags),
++    m_fragmentOffset (hdr.m_fragmentOffset),
++    m_source(hdr.m_source),
++    m_destination(hdr.m_destination),
++    m_checksum (hdr.m_checksum),
++    m_goodChecksum (hdr.m_goodChecksum),
++    m_headerSize(5*4)
++{
++}
++
++Ipv4Header &
++Ipv4Header::operator = (const Ipv4Header &hdr)
++{
++  if (this == &hdr)
++    {
++      return *this;
++    }
++  m_calcChecksum = hdr.m_calcChecksum;
++  m_payloadSize = hdr.m_payloadSize;
++  m_identification = hdr.m_identification;
++  m_tos = hdr.m_tos;
++  m_ttl = hdr.m_ttl;
++  m_protocol = hdr.m_protocol;
++  m_flags = hdr.m_flags;
++  m_fragmentOffset = hdr.m_fragmentOffset;
++  m_source = hdr.m_source;
++  m_destination = hdr.m_destination;
++  m_checksum = hdr.m_checksum;
++  m_goodChecksum = hdr.m_goodChecksum;
++  m_headerSize = 5*4;
++  return *this;
++}
++
+ void
+ Ipv4Header::EnableChecksum (void)
+ {
+diff -ruN ns-3.34/src/internet/model/ipv4-header.h ns-3.34/src/internet/model/ipv4-header.h
+--- ns-3.34/src/internet/model/ipv4-header.h	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/ipv4-header.h	2023-10-17 16:22:07.930912209 +0800
+@@ -38,6 +38,14 @@
+    */
+   Ipv4Header ();
+   /**
++   * \brief Copy Construct
++   */
++  Ipv4Header (const Ipv4Header &hdr);
++  /**
++   * \brief operator equal
++   */  
++  Ipv4Header & operator = (const Ipv4Header &hdr);
++  /**
+    * \brief Enable checksum calculation for this header.
+    */
+   void EnableChecksum (void);
+diff -ruN ns-3.34/src/internet/model/ipv4-interface.cc ns-3.34/src/internet/model/ipv4-interface.cc
+--- ns-3.34/src/internet/model/ipv4-interface.cc	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/ipv4-interface.cc	2023-10-17 16:22:07.930912209 +0800
+@@ -30,6 +30,7 @@
+ #include "ns3/node.h"
+ #include "ns3/pointer.h"
+ #include "ns3/traffic-control-layer.h"
++#include "ns3/double.h"
+ 
+ 
+ namespace ns3 {
+@@ -67,8 +68,15 @@
+     m_node (0), 
+     m_device (0),
+     m_tc (0),
+-    m_cache (0)
+-{
++    m_cache (0),
++    CurDequeueRate(62.5),
++    TarDequeueRate(62.5),
++    QueueDelay(0),
++    ABCMode (false)
++{
++  m_rand = CreateObject<UniformRandomVariable> ();
++  m_rand->SetAttribute("Min", DoubleValue(0.0));
++  m_rand->SetAttribute("Max", DoubleValue(1.0));
+   NS_LOG_FUNCTION (this);
+ }
+ 
+@@ -209,6 +217,36 @@
+   m_forwarding = val;
+ }
+ 
++void Ipv4Interface::UpdateFromQueue(double TarRate, double CurRate, double delay){
++  TarDequeueRate = TarRate;
++  CurDequeueRate = CurRate;
++  QueueDelay = delay;
++}
++
++void Ipv4Interface::ABCEstimation (Ipv4Header &hdr)
++{
++  double QdelayRef = 10;
++  double delta = 133;
++  double target_rate = 0.98 * TarDequeueRate + (TarDequeueRate / delta) * std::min(0.0, (QdelayRef - QueueDelay));
++  double credit_prob = (target_rate /  CurDequeueRate) * 0.5;
++  double RandNum = m_rand->GetValue(0.0, 1.0);
++  if (RandNum < credit_prob) {
++    hdr.SetEcn(Ipv4Header::ECN_ECT1);
++  }
++  else {
++    hdr.SetEcn(Ipv4Header::ECN_ECT0);
++  }
++  // std::cout << "[Ipv4Interface Estimation]" << " time now=" << Simulator::Now().GetMilliSeconds()
++  //         << " target rate=" << TarDequeueRate << " Cur rate=" << CurDequeueRate << " qdelay=" << QueueDelay
++  //         << " credit_prob=" << credit_prob << " random=" << RandNum<<" ECN=" << hdr.GetEcn()<<"\n";
++}
++
++void Ipv4Interface::SetABCMode(bool flag, Ipv4Address adr){
++  NS_LOG_DEBUG ("set ABCMode=" << flag);
++  ABCMode = flag;
++  m_adr = adr;
++}
++
+ void
+ Ipv4Interface::Send (Ptr<Packet> p, const Ipv4Header & hdr, Ipv4Address dest)
+ {
+@@ -217,14 +255,17 @@
+     {
+       return;
+     }
+-
++  Ipv4Header hdr_copy(hdr);
++  Ipv4Header hdr_pkt;
++  if (ABCMode && dest == m_adr && hdr.GetProtocol()== 6 ){ABCEstimation(hdr_copy); hdr_pkt = hdr_copy;}
++  else {hdr_pkt = hdr;}
+   // Check for a loopback device, if it's the case we don't pass through
+   // traffic control layer
+   if (DynamicCast<LoopbackNetDevice> (m_device))
+     {
+       /// \todo additional checks needed here (such as whether multicast
+       /// goes to loopback)?
+-      p->AddHeader (hdr);
++      p->AddHeader (hdr_pkt);
+       m_device->Send (p, m_device->GetBroadcast (), Ipv4L3Protocol::PROT_NUMBER);
+       return;
+     } 
+@@ -236,7 +277,7 @@
+     {
+       if (dest == (*i).GetLocal ())
+         {
+-          p->AddHeader (hdr);
++          p->AddHeader (hdr_pkt);
+           m_tc->Receive (m_device, p, Ipv4L3Protocol::PROT_NUMBER,
+                          m_device->GetBroadcast (),
+                          m_device->GetBroadcast (),
+@@ -281,20 +322,20 @@
+           if (!found)
+             {
+               NS_LOG_LOGIC ("ARP Lookup");
+-              found = arp->Lookup (p, hdr, dest, m_device, m_cache, &hardwareDestination);
++              found = arp->Lookup (p, hdr_pkt, dest, m_device, m_cache, &hardwareDestination);
+             }
+         }
+ 
+       if (found)
+         {
+           NS_LOG_LOGIC ("Address Resolved.  Send.");
+-          m_tc->Send (m_device, Create<Ipv4QueueDiscItem> (p, hardwareDestination, Ipv4L3Protocol::PROT_NUMBER, hdr));
++          m_tc->Send (m_device, Create<Ipv4QueueDiscItem> (p, hardwareDestination, Ipv4L3Protocol::PROT_NUMBER, hdr_pkt));
+         }
+     }
+   else
+     {
+       NS_LOG_LOGIC ("Doesn't need ARP");
+-      m_tc->Send (m_device, Create<Ipv4QueueDiscItem> (p, m_device->GetBroadcast (), Ipv4L3Protocol::PROT_NUMBER, hdr));
++      m_tc->Send (m_device, Create<Ipv4QueueDiscItem> (p, m_device->GetBroadcast (), Ipv4L3Protocol::PROT_NUMBER, hdr_pkt));
+     }
+ }
+ 
+diff -ruN ns-3.34/src/internet/model/ipv4-interface.h ns-3.34/src/internet/model/ipv4-interface.h
+--- ns-3.34/src/internet/model/ipv4-interface.h	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/ipv4-interface.h	2023-10-17 16:22:07.930912209 +0800
+@@ -25,7 +25,8 @@
+ #include <list>
+ #include "ns3/ptr.h"
+ #include "ns3/object.h"
+-
++#include "ns3/ipv4-address.h"
++#include "ns3/random-variable-stream.h"
+ namespace ns3 {
+ 
+ class NetDevice;
+@@ -188,6 +189,12 @@
+    */
+   Ipv4InterfaceAddress RemoveAddress (Ipv4Address address);
+ 
++  void UpdateFromQueue(double TarRate, double CurRate, double delay);
++
++  void ABCEstimation(Ipv4Header &hdr);
++
++  void SetABCMode(bool flag, Ipv4Address adr);
++
+ protected:
+   virtual void DoDispose (void);
+ private:
+@@ -239,6 +246,12 @@
+   Ptr<NetDevice> m_device; //!< The associated NetDevice
+   Ptr<TrafficControlLayer> m_tc; //!< The associated TrafficControlLayer
+   Ptr<ArpCache> m_cache; //!< ARP cache
++  double CurDequeueRate;
++  double TarDequeueRate;
++  double QueueDelay;
++  bool ABCMode;
++  Ipv4Address m_adr;
++  Ptr<UniformRandomVariable> m_rand;
+ };
+ 
+ } // namespace ns3
+diff -ruN ns-3.34/src/internet/model/tcp-rate-ops.cc ns-3.34/src/internet/model/tcp-rate-ops.cc
+--- ns-3.34/src/internet/model/tcp-rate-ops.cc	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/tcp-rate-ops.cc	2023-10-17 16:22:07.938912150 +0800
+@@ -134,6 +134,10 @@
+   return m_rateSample;
+ }
+ 
++void TcpRateLinux::UpdateRtt(Time rtt){
++     m_rateSample.m_rtt=rtt;
++ }
++
+ void
+ TcpRateLinux::CalculateAppLimited (uint32_t cWnd, uint32_t in_flight,
+                                    uint32_t segmentSize, const SequenceNumber32 &tailSeq,
+@@ -178,17 +182,18 @@
+   if (m_rateSample.m_priorDelivered == 0
+       || skbInfo.m_delivered > m_rateSample.m_priorDelivered)
+     {
+-      m_rateSample.m_ackElapsed       = Simulator::Now () - m_rateSample.m_priorTime;
++      // m_rateSample.m_ackElapsed       = Simulator::Now () - m_rateSample.m_priorTime;
+       m_rateSample.m_priorDelivered   = skbInfo.m_delivered;
+       m_rateSample.m_priorTime        = skbInfo.m_deliveredTime;
+       m_rateSample.m_isAppLimited     = skbInfo.m_isAppLimited;
+       m_rateSample.m_sendElapsed      = skb->GetLastSent () - skbInfo.m_firstSent;
+ 
+-      m_rateSampleTrace (m_rateSample);
++      // m_rateSampleTrace (m_rateSample);
+ 
+       m_rate.m_firstSentTime          = skb->GetLastSent ();
+     }
+-
++    m_rateSample.m_ackElapsed       = Simulator::Now () - m_rateSample.m_priorTime;
++    m_rateSampleTrace (m_rateSample);
+   /* Mark off the skb delivered once it's taken into account to avoid being
+    * used again when it's cumulatively acked, in case it was SACKed.
+    */
+diff -ruN ns-3.34/src/internet/model/tcp-rate-ops.h ns-3.34/src/internet/model/tcp-rate-ops.h
+--- ns-3.34/src/internet/model/tcp-rate-ops.h	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/tcp-rate-ops.h	2023-10-17 16:22:07.938912150 +0800
+@@ -119,6 +119,11 @@
+    */
+   virtual const TcpRateConnection & GetConnectionRate () = 0;
+ 
++  /*
++   * \param rtt Instant RTT
++   */
++   virtual void UpdateRtt(Time rtt)=0;
++
+   /**
+    * \brief Rate Sample structure
+    *
+@@ -137,6 +142,7 @@
+     Time          m_interval       {Seconds (0.0)};    //!< The length of the sampling interval
+     int32_t       m_delivered      {0};                //!< The amount of data marked as delivered over the sampling interval
+     uint32_t      m_priorDelivered {0};                //!< The delivered count of the most recent packet delivered
++    Time          m_rtt            {Time::Max()};      //!< Instant rtt value
+     Time          m_priorTime      {Seconds (0.0)};    //!< The delivered time of the most recent packet delivered
+     Time          m_sendElapsed    {Seconds (0.0)};    //!< Send time interval calculated from the most recent packet delivered
+     Time          m_ackElapsed     {Seconds (0.0)};    //!< ACK time interval calculated from the most recent packet delivered
+@@ -203,7 +209,7 @@
+   {
+     return m_rate;
+   }
+-
++  virtual void UpdateRtt(Time rtt) override;
+   /**
+    * TracedCallback signature for tcp rate update events.
+    *
+diff -ruN ns-3.34/src/internet/model/tcp-socket-base.cc ns-3.34/src/internet/model/tcp-socket-base.cc
+--- ns-3.34/src/internet/model/tcp-socket-base.cc	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/tcp-socket-base.cc	2023-10-17 16:22:07.938912150 +0800
+@@ -365,6 +365,10 @@
+     {
+       m_rtt = sock.m_rtt->Copy ();
+     }
++  if (sock.m_rtt_net)
++    {
++      m_rtt_net = sock.m_rtt_net->Copy ();
++    }
+   // Reset all callbacks to null
+   Callback<void, Ptr< Socket > > vPS = MakeNullCallback<void, Ptr<Socket> > ();
+   Callback<void, Ptr<Socket>, const Address &> vPSA = MakeNullCallback<void, Ptr<Socket>, const Address &> ();
+@@ -488,6 +492,27 @@
+ TcpSocketBase::SetRtt (Ptr<RttEstimator> rtt)
+ {
+   m_rtt = rtt;
++  ObjectFactory rttFactory;
++  rttFactory.SetTypeId(RttMeanDeviation::GetTypeId ());
++  m_rtt_net = rttFactory.Create<RttEstimator> ();
++}
++
++Ptr<RttEstimator>
++TcpSocketBase::GetRtt (void) const
++{
++  return m_rtt;
++}
++
++Ptr<RttEstimator>
++TcpSocketBase::GetRttNet (void) const
++{
++  return m_rtt_net;
++}
++
++uint32_t
++TcpSocketBase::GetCwndByte (void) const
++{
++  return m_tcb->m_cWnd.Get();
+ }
+ 
+ /* Inherit from Socket class: Returns error code */
+@@ -716,6 +741,7 @@
+ 
+   // Re-initialize parameters in case this socket is being reused after CLOSE
+   m_rtt->Reset ();
++  m_rtt_net->Reset ();
+   m_synCount = m_synRetries;
+   m_dataRetrCount = m_dataRetries;
+ 
+@@ -1132,6 +1158,12 @@
+   return (tail < m_tcb->m_rxBuffer->NextRxSequence () || m_tcb->m_rxBuffer->MaxRxSequence () <= head);
+ }
+ 
++Ipv4Header::EcnType
++TcpSocketBase::GetEcn (void) 
++{
++  return m_tcb->m_EcnValue;
++}
++
+ /* Function called by the L3 protocol when it received a packet to pass on to
+     the TCP. This function is registered as the "RxCallback" function in
+     SetupCallback(), which invoked by Bind(), and CompleteFork() */
+@@ -1157,7 +1189,7 @@
+     {
+       return;
+     }
+-
++  m_tcb->m_EcnValue = header.GetEcn();
+   if (header.GetEcn() == Ipv4Header::ECN_CE && m_ecnCESeq < tcpHeader.GetSequenceNumber ())
+     {
+       NS_LOG_INFO ("Received CE flag is valid");
+@@ -2165,7 +2197,7 @@
+                             " cWnd: " << m_tcb->m_cWnd <<
+                             " ssTh: " << m_tcb->m_ssThresh <<
+                             " segsAcked: " << segsAcked);
+-
++              
+               NewAck (ackNumber, true);
+             }
+         }
+@@ -2726,6 +2758,7 @@
+         { // No more connection retries, give up
+           NS_LOG_LOGIC ("Connection failed.");
+           m_rtt->Reset (); //According to recommendation -> RFC 6298
++          m_rtt_net->Reset ();
+           NotifyConnectionFailed ();
+           m_state = CLOSED;
+           DeallocateEndPoint ();
+@@ -2785,7 +2818,9 @@
+       NS_LOG_LOGIC ("Schedule retransmission timeout at time "
+                     << Simulator::Now ().GetSeconds () << " to expire at time "
+                     << (Simulator::Now () + m_rto.Get ()).GetSeconds ());
+-      m_retxEvent = Simulator::Schedule (m_rto, &TcpSocketBase::SendEmptyPacket, this, flags);
++      if (!hasFin) {
++        m_retxEvent = Simulator::Schedule (m_rto, &TcpSocketBase::SendEmptyPacket, this, flags);
++      }
+     }
+ }
+ 
+@@ -2961,30 +2996,46 @@
+    * if both options are set. Once the packet got to layer three, only
+    * the corresponding tags will be read.
+    */
+-  if (GetIpTos ())
+-    {
++  if (m_tcb->m_ecnMode == TcpSocketState::ABCEcn){
++      m_tcb->m_ectCodePoint = TcpSocketState::Ect1;
+       SocketIpTosTag ipTosTag;
+-      if (m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED && !CheckNoEcn (GetIpTos ()))
+-        {
+-          ipTosTag.SetTos (MarkEcnCodePoint (GetIpTos (), m_tcb->m_ectCodePoint));
+-        }
+-      else
+-        {
+-          // Set the last received ipTos
+-          ipTosTag.SetTos (GetIpTos ());
+-        }
+-      p->AddPacketTag (ipTosTag);
+-    }
+-  else
+-    {
+-      if ((m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED && p->GetSize () > 0) || m_tcb->m_ecnMode == TcpSocketState::DctcpEcn)
+-        {
++      ipTosTag.SetTos (MarkEcnCodePoint (GetIpTos (),  m_tcb->m_ectCodePoint));
++      p->AddPacketTag(ipTosTag);
++  }
++  if (m_tcb->m_EcnValue == Ipv4Header::ECN_ECT0 || m_tcb->m_EcnValue == Ipv4Header::ECN_ECT1){
++      if(m_tcb->m_ecnMode != TcpSocketState::ABCEcn){
++          if(m_tcb->m_EcnValue == Ipv4Header::ECN_ECT0){m_tcb->m_ectCodePoint = TcpSocketState::Ect0;}
++          if(m_tcb->m_EcnValue == Ipv4Header::ECN_ECT1){m_tcb->m_ectCodePoint = TcpSocketState::Ect1;}
+           SocketIpTosTag ipTosTag;
+-          ipTosTag.SetTos (MarkEcnCodePoint (GetIpTos (), m_tcb->m_ectCodePoint));
++          ipTosTag.SetTos (MarkEcnCodePoint (GetIpTos (),  m_tcb->m_ectCodePoint));
++          p->AddPacketTag(ipTosTag);        
++      }
++  }
++  else {
++    if (GetIpTos ())
++      {
++          SocketIpTosTag ipTosTag;
++          if (m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED && !CheckNoEcn (GetIpTos ()))
++          {
++              ipTosTag.SetTos (MarkEcnCodePoint (GetIpTos (), m_tcb->m_ectCodePoint));
++          }
++          else
++          {
++              // Set the last received ipTos
++              ipTosTag.SetTos (GetIpTos ());
++          }
+           p->AddPacketTag (ipTosTag);
+-        }
+-    }
+-
++      }
++      else
++      {
++          if ((m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED && p->GetSize () > 0) || m_tcb->m_ecnMode == TcpSocketState::DctcpEcn)
++          {
++              SocketIpTosTag ipTosTag;
++              ipTosTag.SetTos (MarkEcnCodePoint (GetIpTos (), m_tcb->m_ectCodePoint));
++              p->AddPacketTag (ipTosTag);
++          }
++      }
++  }
+   if (IsManualIpv6Tclass ())
+     {
+       SocketIpv6TclassTag ipTclassTag;
+@@ -3042,8 +3093,8 @@
+   bool isStartOfTransmission = BytesInFlight () == 0U;
+   TcpTxItem *outItem = m_txBuffer->CopyFromSequence (maxSize, seq);
+ 
+-  m_rateOps->SkbSent(outItem, isStartOfTransmission);
+-
++  m_rateOps->SkbSent(outItem, isStartOfTransmission &&
++    (m_tcb->m_highTxMark == m_tcb->m_nextTxSequence));
+   bool isRetransmission = outItem->IsRetrans ();
+   Ptr<Packet> p = outItem->GetPacketCopy ();
+   uint32_t sz = p->GetSize (); // Size of packet
+@@ -3268,6 +3319,13 @@
+               NS_LOG_LOGIC ("Preventing Silly Window Syndrome. Wait to send.");
+               break; // No more
+             }
++          //
++          uint32_t availableRwnd = static_cast<uint32_t> (nextHigh - next);
++          if (availableRwnd < m_tcb->m_segmentSize && availableData > availableRwnd)
++            {
++              NS_LOG_LOGIC (" Rwnd limitation prevents senders from sending data ");
++              break; // No more              
++            }
+           // Nagle's algorithm (RFC896): Hold off sending if there is unacked data
+           // in the buffer and the amount of data to send is less than one segment
+           if (!m_noDelay && UnAckDataCount () > 0 && availableData < m_tcb->m_segmentSize)
+@@ -3282,7 +3340,7 @@
+           // NextSeg () may have further constrained the segment size
+           uint32_t maxSizeToSend = static_cast<uint32_t> (nextHigh - next);
+           s = std::min (s, maxSizeToSend);
+-
++          
+           // (C.2) If any of the data octets sent in (C.1) are below HighData,
+           //       HighRxt MUST be set to the highest sequence number of the
+           //       retransmitted segment unless NextSeg () rule (4) was
+@@ -3301,7 +3359,7 @@
+               m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_TX_START);
+             }
+           uint32_t sz = SendDataPacket (m_tcb->m_nextTxSequence, s, withAck);
+-
++          
+           NS_LOG_LOGIC (" rxwin " << m_rWnd <<
+                         " segsize " << m_tcb->m_segmentSize <<
+                         " highestRxAck " << m_txBuffer->HeadSequence () <<
+@@ -3527,6 +3585,43 @@
+   SequenceNumber32 ackSeq = tcpHeader.GetAckNumber ();
+   Time m = Time (0.0);
+ 
++  Ptr<const TcpOptionSack> sack = DynamicCast<const TcpOptionSack> (tcpHeader.GetOption (TcpOption::SACK));
++  SequenceNumber32 sackHighSeqFirst = SequenceNumber32 (0);
++  SequenceNumber32 sackHighSeqSecond = SequenceNumber32 (0);
++  Time m_net = Time(0.0);
++  if (sack && !m_history.empty ()) 
++    {
++      TcpOptionSack::SackList SackListCopy = sack->GetSackList();
++      TcpOptionSack::SackList::const_iterator it = SackListCopy.begin();
++      uint32_t len = 0;
++      while(true){
++        if (it->first > sackHighSeqFirst)
++        {
++          sackHighSeqFirst = it->first;
++          sackHighSeqSecond = it->second;
++        }   
++        it++; 
++        len++;
++        if(len == SackListCopy.size()) {break;}
++      }
++      if (sackHighSeqSecond != m_lastSackHighSeqSecond) {
++        SequenceNumber32 SeqUse = SequenceNumber32(0);
++        Time TimeUse = Time(0);
++        for(auto it = m_history.begin(); it != m_history.end(); ++it){
++          if(it->seq >= sackHighSeqFirst && it->seq < sackHighSeqSecond){
++            m_net = Simulator::Now() - it->time;
++            SeqUse = it->seq;
++            TimeUse = it->time;
++          }
++        }
++        NS_LOG_DEBUG ("[Rtt Net Estimation] " << this << " time now " << Simulator::Now() <<
++          " sack (" << sackHighSeqFirst << "," << sackHighSeqSecond << ") " << 
++          " Seq " << SeqUse << " send time " << TimeUse << " rtt sample " << m_net);
++        m_lastSackHighSeqSecond = sackHighSeqSecond;
++      }
++    }
++
++  
+   // An ack has been received, calculate rtt and log this measurement
+   // Note we use a linear search (O(n)) for this since for the common
+   // case the ack'ed packet will be at the head of the list
+@@ -3566,6 +3661,7 @@
+ 
+   if (!m.IsZero ())
+     {
++      m_rateOps->UpdateRtt (m);
+       m_rtt->Measurement (m);                // Log the measurement
+       // RFC 6298, clause 2.4
+       m_rto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
+@@ -3573,6 +3669,14 @@
+       m_tcb->m_minRtt = std::min (m_tcb->m_lastRtt.Get (), m_tcb->m_minRtt);
+       NS_LOG_INFO (this << m_tcb->m_lastRtt << m_tcb->m_minRtt);
+     }
++  if(!m.IsZero())
++    {
++      m_rtt_net->Measurement (m);
++    }
++  else if(!m_net.IsZero())
++    {
++      m_rtt_net->Measurement (m_net);
++    }
+ }
+ 
+ // Called by the ReceivedAck() when new ACK received and by ProcessSynRcvd()
+@@ -3711,8 +3815,8 @@
+   m_recoverActive = true;
+ 
+   // RFC 6298, clause 2.5, double the timer
+-  Time doubledRto = m_rto + m_rto;
+-  m_rto = Min (doubledRto, Time::FromDouble (60,  Time::S));
++  // Time doubledRto = m_rto + m_rto;
++  // m_rto = Min (doubledRto, Time::FromDouble (60,  Time::S));
+ 
+   // Empty RTT history
+   m_history.clear ();
+@@ -4555,6 +4659,11 @@
+   return m_highRxAckMark.Get ();
+ }
+ 
++Ptr<TcpCongestionOps>
++TcpSocketBase::GetCon (void)
++{
++  return m_congestionControl;
++}
+ 
+ //RttHistory methods
+ RttHistory::RttHistory (SequenceNumber32 s, uint32_t c, Time t)
+diff -ruN ns-3.34/src/internet/model/tcp-socket-base.h ns-3.34/src/internet/model/tcp-socket-base.h
+--- ns-3.34/src/internet/model/tcp-socket-base.h	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/tcp-socket-base.h	2023-10-17 16:22:07.938912150 +0800
+@@ -249,6 +249,8 @@
+   TcpSocketBase (const TcpSocketBase& sock);
+   virtual ~TcpSocketBase (void);
+ 
++  Ptr<TcpCongestionOps> GetCon (void);
++
+   // Set associated Node, TcpL4Protocol, RttEstimator to this socket
+ 
+   /**
+@@ -269,6 +271,11 @@
+    */
+   virtual void SetRtt (Ptr<RttEstimator> rtt);
+ 
++  Ptr<RttEstimator> GetRtt (void) const;
++  Ptr<RttEstimator> GetRttNet (void) const;
++
++  uint32_t GetCwndByte (void) const;
++  
+   /**
+    * \brief Sets the Minimum RTO.
+    * \param minRto The minimum RTO.
+@@ -317,6 +324,8 @@
+    */
+   uint32_t GetRetxThresh (void) const { return m_retxThresh; }
+ 
++  Ipv4Header::EcnType GetEcn (void);
++
+   /**
+    * \brief Callback pointer for pacing rate trace chaining
+    */
+@@ -554,6 +563,18 @@
+     }
+ 
+   /**
++   * \brief mark ECN code point
++   *
++   * \param tos the TOS byte to modify
++   * \param codePoint the codepoint to use
++   * \return TOS with specified ECN code point
++   */
++  inline uint8_t MarkABCEcn (const uint8_t tos, const TcpSocketState::ABCEcnState_t mode) const
++    {
++      return ((tos & 0xfc) | mode);
++    }
++
++  /**
+    * \brief Set ECN mode of use on the socket
+    *
+    * \param useEcn Mode of ECN to use.
+@@ -1283,6 +1304,8 @@
+   Callback<void, Ipv6Address,uint8_t,uint8_t,uint8_t,uint32_t> m_icmpCallback6; //!< ICMPv6 callback
+ 
+   Ptr<RttEstimator> m_rtt; //!< Round trip time estimator
++  Ptr<RttEstimator> m_rtt_net;
++  SequenceNumber32  m_lastSackHighSeqSecond {SequenceNumber32 (0)};
+ 
+   // Tx buffer management
+   Ptr<TcpTxBuffer> m_txBuffer; //!< Tx buffer
+diff -ruN ns-3.34/src/internet/model/tcp-socket.cc ns-3.34/src/internet/model/tcp-socket.cc
+--- ns-3.34/src/internet/model/tcp-socket.cc	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/tcp-socket.cc	2023-10-17 16:22:07.938912150 +0800
+@@ -104,7 +104,7 @@
+                    MakeTimeChecker ())
+     .AddAttribute ("DelAckCount",
+                    "Number of packets to wait before sending a TCP ack",
+-                   UintegerValue (2),
++                   UintegerValue (1),
+                    MakeUintegerAccessor (&TcpSocket::GetDelAckMaxCount,
+                                          &TcpSocket::SetDelAckMaxCount),
+                    MakeUintegerChecker<uint32_t> ())
+diff -ruN ns-3.34/src/internet/model/tcp-socket-state.h ns-3.34/src/internet/model/tcp-socket-state.h
+--- ns-3.34/src/internet/model/tcp-socket-state.h	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/tcp-socket-state.h	2023-10-17 16:22:07.938912150 +0800
+@@ -23,6 +23,7 @@
+ #include "ns3/traced-value.h"
+ #include "ns3/sequence-number.h"
+ #include "tcp-rx-buffer.h"
++#include "ns3/ipv4-header.h"
+ 
+ namespace ns3 {
+ 
+@@ -134,6 +135,7 @@
+     {
+       ClassicEcn,  //!< ECN functionality as described in RFC 3168.
+       DctcpEcn,    //!< ECN functionality as described in RFC 8257. Note: this mode is specific to DCTCP.
++      ABCEcn,
+     } EcnMode_t;
+ 
+    /**
+@@ -151,6 +153,17 @@
+                         *  This state is used for tracing.                                                               */
+   } EcnState_t;
+ 
++   /**
++   * \brief Definition of the ABC Ecn state machine
++   *
++   */
++  typedef enum
++  {                                    
++    ABC_NOT_USE = 0,
++    ECN_accelerate = 1,                                                    
++    ECN_brake = 2      
++  } ABCEcnState_t;
++
+   /**
+    * \brief Literal names of TCP states for use in log messages
+    */
+@@ -180,7 +193,8 @@
+   TracedValue<TcpCongState_t> m_congState {CA_OPEN}; //!< State in the Congestion state machine
+ 
+   TracedValue<EcnState_t> m_ecnState {ECN_DISABLED}; //!< Current ECN State, represented as combination of EcnState values
+-
++  ABCEcnState_t           m_ABCecnState {ABC_NOT_USE};
++  Ipv4Header::EcnType     m_EcnValue {Ipv4Header::ECN_NotECT};
+   TracedValue<SequenceNumber32> m_highTxMark     {0}; //!< Highest seqno ever sent, regardless of ReTx
+   TracedValue<SequenceNumber32> m_nextTxSequence {0}; //!< Next seqnum to be sent (SND.NXT), ReTx pushes it back
+ 
+diff -ruN ns-3.34/src/internet/model/tcp-tx-buffer.cc ns-3.34/src/internet/model/tcp-tx-buffer.cc
+--- ns-3.34/src/internet/model/tcp-tx-buffer.cc	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/tcp-tx-buffer.cc	2023-10-17 16:22:07.938912150 +0800
+@@ -1506,4 +1506,19 @@
+   return os;
+ }
+ 
++uint32_t 
++TcpTxBuffer::GetSentSize(){
++  return m_sentSize;
++}
++
++void
++TcpTxBuffer::Print(){
++  std::cout<<"[PacketSenderTcp] " << "size = " << m_sentList.size () <<
++    " Total size: " << m_size <<
++    " m_firstByteSeq = " << m_firstByteSeq <<
++    " m_sentSize = " << m_sentSize <<
++    " m_retransOut = " << m_retrans <<
++    " m_lostOut = " << m_lostOut <<
++    " m_sackedOut = " << m_sackedOut <<std::endl;
++}
+ } // namespace ns3
+diff -ruN ns-3.34/src/internet/model/tcp-tx-buffer.h ns-3.34/src/internet/model/tcp-tx-buffer.h
+--- ns-3.34/src/internet/model/tcp-tx-buffer.h	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/tcp-tx-buffer.h	2023-10-17 16:22:07.938912150 +0800
+@@ -407,6 +407,9 @@
+    */
+   void SetRWndCallback (Callback<uint32_t> rWndCallback);
+ 
++  uint32_t GetSentSize();
++  void Print();
++
+ private:
+   friend std::ostream & operator<< (std::ostream & os, TcpTxBuffer const & tcpTxBuf);
+ 
+diff -ruN ns-3.34/src/internet/model/windowed-filter.h ns-3.34/src/internet/model/windowed-filter.h
+--- ns-3.34/src/internet/model/windowed-filter.h	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/model/windowed-filter.h	2023-10-17 16:22:07.942912120 +0800
+@@ -82,10 +82,10 @@
+    */
+   bool operator() (const T& lhs, const T& rhs) const
+   {
+-    if (rhs == 0 || lhs == 0)
+-      {
+-        return false;
+-      }
++    // if (rhs == 0 || lhs == 0)
++    //   {
++    //     return false;
++    //   }
+     return lhs <= rhs;
+   }
+ };
+@@ -106,10 +106,10 @@
+    */
+   bool operator() (const T& lhs, const T& rhs) const
+   {
+-    if (rhs == 0 || lhs == 0)
+-      {
+-        return false;
+-      }
++    // if (rhs == 0 || lhs == 0)
++    //   {
++    //     return false;
++    //   }
+     return lhs >= rhs;
+   }
+ };
+diff -ruN ns-3.34/src/internet/wscript ns-3.34/src/internet/wscript
+--- ns-3.34/src/internet/wscript	2021-07-15 01:31:06.000000000 +0800
++++ ns-3.34/src/internet/wscript	2023-10-17 18:22:47.664794126 +0800
+@@ -156,6 +156,7 @@
+         'model/tcp-scalable.cc', 
+         'model/tcp-veno.cc',
+         'model/tcp-bic.cc',
++        'model/tcp-copa.cc',
+         'model/tcp-cubic.cc',
+         'model/tcp-yeah.cc',
+         'model/tcp-ledbat.cc',
+@@ -163,6 +164,7 @@
+         'model/tcp-htcp.cc',
+         'model/tcp-lp.cc',
+         'model/tcp-dctcp.cc',
++        'model/tcp-abc.cc',
+         'model/tcp-bbr.cc',
+         'model/tcp-rx-buffer.cc',
+         'model/tcp-tx-buffer.cc',
+@@ -416,12 +418,14 @@
+         'model/tcp-scalable.h',
+         'model/tcp-veno.h',
+         'model/tcp-bic.h',
++        'model/tcp-copa.h',
+         'model/tcp-cubic.h',
+         'model/tcp-yeah.h',
+         'model/tcp-illinois.h',
+         'model/tcp-htcp.h',
+         'model/tcp-lp.h',
+         'model/tcp-dctcp.h',
++        'model/tcp-abc.h',
+         'model/windowed-filter.h',
+         'model/tcp-bbr.h',
+         'model/tcp-ledbat.h',
+diff -ruN ns-3.34/src/network/utils/drop-tail-queue.h ns-3.34/src/network/utils/drop-tail-queue.h
+--- ns-3.34/src/network/utils/drop-tail-queue.h	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/network/utils/drop-tail-queue.h	2023-10-17 16:22:08.186910296 +0800
+@@ -50,6 +50,7 @@
+   virtual Ptr<Item> Dequeue (void);
+   virtual Ptr<Item> Remove (void);
+   virtual Ptr<const Item> Peek (void) const;
++  virtual Ptr<const Item> MyPeek (uint32_t pos) const;
+ 
+ private:
+   using Queue<Item>::begin;
+@@ -143,6 +144,20 @@
+   return DoPeek (begin ());
+ }
+ 
++template <typename Item>
++Ptr<const Item>
++DropTailQueue<Item>::MyPeek (uint32_t pos) const
++{
++  NS_LOG_FUNCTION (this);
++  uint32_t cur = 0;
++  auto it = begin();
++  while (cur < pos && it != end()) {
++    it++;
++    cur++;
++  }
++  return *it;
++}
++
+ // The following explicit template instantiation declarations prevent all the
+ // translation units including this header file to implicitly instantiate the
+ // DropTailQueue<Packet> class and the DropTailQueue<QueueDiscItem> class. The
+diff -ruN ns-3.34/src/point-to-point/model/point-to-point-channel.cc ns-3.34/src/point-to-point/model/point-to-point-channel.cc
+--- ns-3.34/src/point-to-point/model/point-to-point-channel.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/point-to-point/model/point-to-point-channel.cc	2023-10-17 16:22:08.202910177 +0800
+@@ -98,7 +98,7 @@
+   uint32_t wire = src == m_link[0].m_src ? 0 : 1;
+ 
+   Simulator::ScheduleWithContext (m_link[wire].m_dst->GetNode ()->GetId (),
+-                                  txTime + m_delay, &PointToPointNetDevice::Receive,
++                                  m_delay, &PointToPointNetDevice::Receive,
+                                   m_link[wire].m_dst, p->Copy ());
+ 
+   // Call the tx anim callback on the net device
+diff -ruN ns-3.34/src/point-to-point/model/point-to-point-net-device.cc ns-3.34/src/point-to-point/model/point-to-point-net-device.cc
+--- ns-3.34/src/point-to-point/model/point-to-point-net-device.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/point-to-point/model/point-to-point-net-device.cc	2023-10-17 16:22:08.202910177 +0800
+@@ -21,6 +21,8 @@
+ #include "ns3/simulator.h"
+ #include "ns3/mac48-address.h"
+ #include "ns3/llc-snap-header.h"
++#include "ns3/ipv4-header.h"
++#include "ns3/tcp-header.h"
+ #include "ns3/error-model.h"
+ #include "ns3/trace-source-accessor.h"
+ #include "ns3/uinteger.h"
+@@ -232,6 +234,20 @@
+   m_tInterframeGap = t;
+ }
+ 
++void 
++PointToPointNetDevice::GetSeqNumber (Ptr<Packet> p)
++{
++  Ptr<Packet> pCopy = p->Copy();
++  PppHeader ppphdr = PppHeader();
++  pCopy->RemoveHeader(ppphdr);
++  Ipv4Header ipv4hdr = Ipv4Header();
++  pCopy->RemoveHeader(ipv4hdr);
++  Ptr<Packet> pToPush = p->Copy();
++  if(ipv4hdr.GetProtocol()==6){
++      m_PacketList.push_back(pToPush);
++  }
++}
++
+ bool
+ PointToPointNetDevice::TransmitStart (Ptr<Packet> p)
+ {
+@@ -250,10 +266,9 @@
+ 
+   Time txTime = m_bps.CalculateBytesTxTime (p->GetSize ());
+   Time txCompleteTime = txTime + m_tInterframeGap;
+-
+   NS_LOG_LOGIC ("Schedule TransmitCompleteEvent in " << txCompleteTime.As (Time::S));
+   Simulator::Schedule (txCompleteTime, &PointToPointNetDevice::TransmitComplete, this);
+-
++  GetSeqNumber(p);
+   bool result = m_channel->TransmitStart (p, this, txTime);
+   if (result == false)
+     {
+@@ -367,10 +382,18 @@
+       //
+       ProcessHeader (packet, protocol);
+ 
+-      if (!m_promiscCallback.IsNull ())
++      // if (!m_promiscCallback.IsNull ())
++      //   {
++      //     m_macPromiscRxTrace (originalPacket);
++      //     m_promiscCallback (this, packet, protocol, GetRemote (), GetAddress (), NetDevice::PACKET_HOST);
++      //   }
++
++      if (!m_promiscCallback.empty())
+         {
+           m_macPromiscRxTrace (originalPacket);
+-          m_promiscCallback (this, packet, protocol, GetRemote (), GetAddress (), NetDevice::PACKET_HOST);
++          for(auto it = m_promiscCallback.begin(); it != m_promiscCallback.end(); ++it){
++              (*it)(this, packet, protocol, GetRemote (), GetAddress (), NetDevice::PACKET_HOST);
++          }
+         }
+ 
+       m_macRxTrace (originalPacket);
+@@ -531,6 +554,26 @@
+ 
+   m_macTxTrace (packet);
+ 
++  if (m_isDropBeforeTcpSeq) {
++    Ptr<Packet> parsedPkt = packet->Copy();
++    Ptr<Packet> dynamicPkt = ConstCast<Packet> (packet);
++    Ipv4Header ipHdr;
++    parsedPkt->RemoveHeader (ipHdr);
++    if (ipHdr.GetProtocol () == 6) {
++      TcpHeader tcpHdr;
++      parsedPkt->PeekHeader (tcpHdr);
++      if (int(tcpHdr.GetFlags()) == 16) {
++        SequenceNumber32 seq = tcpHdr.GetSequenceNumber ();
++        if (seq < m_dropBeforeTcpSeq) {
++          if (!(seq < SequenceNumber32 (1 << 31) && m_dropBeforeTcpSeq > SequenceNumber32 (1 << 31))) {
++            m_macTxDropTrace (packet);
++            return false;
++          }
++        }
++      }
++    }
++  }
++
+   //
+   // We should enqueue and dequeue the packet to hit the tracing hooks.
+   //
+@@ -557,6 +600,87 @@
+ }
+ 
+ bool
++PointToPointNetDevice::SendWithEmergency (
++  Ptr<Packet> packet, 
++  const Address &dest, 
++  uint16_t protocolNumber)
++{
++  NS_LOG_FUNCTION (this << packet << dest << protocolNumber);
++  NS_LOG_LOGIC ("p=" << packet << ", dest=" << &dest);
++  NS_LOG_LOGIC ("UID is " << packet->GetUid ());
++
++  //
++  // If IsLinkUp() is false it means there is no channel to send any packet 
++  // over so we just hit the drop trace on the packet and return an error.
++  //
++  if (IsLinkUp () == false)
++    {
++      m_macTxDropTrace (packet);
++      return false;
++    }
++
++  //
++  // Stick a point to point protocol header on the packet in preparation for
++  // shoving it out the door.
++  //
++  AddHeader (packet, protocolNumber);
++
++  m_macTxTrace (packet);
++
++  //
++  // We should enqueue and dequeue the packet to hit the tracing hooks.
++  //
++  if (m_queue->Enqueue (packet))
++    {
++      //
++      // If the channel is ready for transition we send the packet right now
++      // 
++      if (m_txMachineState == READY)
++        {
++          packet = m_queue->Dequeue ();
++          m_snifferTrace (packet);
++          m_promiscSnifferTrace (packet);
++          bool ret = TransmitStart (packet);
++          return ret;
++        }
++      return true;
++    }
++  else
++    {
++      m_queue->SetMaxSize (QueueSize (m_queue->GetMaxSize ().GetUnit (), m_queue->GetMaxSize ().GetValue() + 1));
++      m_emergentToken += 1;
++      if (m_queue->Enqueue (packet))
++      {
++        //
++        // If the channel is ready for transition we send the packet right now
++        // 
++        if (m_txMachineState == READY)
++          {
++            packet = m_queue->Dequeue ();
++            m_snifferTrace (packet);
++            m_promiscSnifferTrace (packet);
++            bool ret = TransmitStart (packet);
++            return ret;
++          }
++        return true;
++      }
++    }
++
++  // Enqueue may fail (overflow)
++
++  m_macTxDropTrace (packet);
++  return false;
++}
++
++bool 
++PointToPointNetDevice::SetTcpDropSeq (SequenceNumber32 seq)
++{
++  m_isDropBeforeTcpSeq = true;
++  m_dropBeforeTcpSeq = seq;
++  return true;
++}
++
++bool
+ PointToPointNetDevice::SendFrom (Ptr<Packet> packet, 
+                                  const Address &source, 
+                                  const Address &dest, 
+@@ -595,7 +719,7 @@
+ void
+ PointToPointNetDevice::SetPromiscReceiveCallback (NetDevice::PromiscReceiveCallback cb)
+ {
+-  m_promiscCallback = cb;
++  m_promiscCallback.push_back(cb);
+ }
+ 
+ bool
+diff -ruN ns-3.34/src/point-to-point/model/point-to-point-net-device.h ns-3.34/src/point-to-point/model/point-to-point-net-device.h
+--- ns-3.34/src/point-to-point/model/point-to-point-net-device.h	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/point-to-point/model/point-to-point-net-device.h	2023-10-17 16:22:08.202910177 +0800
+@@ -30,6 +30,10 @@
+ #include "ns3/data-rate.h"
+ #include "ns3/ptr.h"
+ #include "ns3/mac48-address.h"
++#include "ns3/ipv4-header.h"
++#include "ns3/tcp-header.h"
++#include <unordered_map>
++#include <map>
+ 
+ namespace ns3 {
+ 
+@@ -175,7 +179,9 @@
+   virtual bool IsPointToPoint (void) const;
+   virtual bool IsBridge (void) const;
+ 
++  bool SetTcpDropSeq (SequenceNumber32 seq);
+   virtual bool Send (Ptr<Packet> packet, const Address &dest, uint16_t protocolNumber);
++  virtual bool SendWithEmergency (Ptr<Packet> packet, const Address &dest, uint16_t protocolNumber);
+   virtual bool SendFrom (Ptr<Packet> packet, const Address& source, const Address& dest, uint16_t protocolNumber);
+ 
+   virtual Ptr<Node> GetNode (void) const;
+@@ -190,6 +196,9 @@
+   virtual void SetPromiscReceiveCallback (PromiscReceiveCallback cb);
+   virtual bool SupportsSendFrom (void) const;
+ 
++  void GetSeqNumber(Ptr<Packet> p);
++  std::list<Ptr<Packet>> m_PacketList;
++
+ protected:
+   /**
+    * \brief Handler for MPI receive event
+@@ -437,7 +446,7 @@
+   Ptr<Node> m_node;         //!< Node owning this NetDevice
+   Mac48Address m_address;   //!< Mac48Address of this NetDevice
+   NetDevice::ReceiveCallback m_rxCallback;   //!< Receive callback
+-  NetDevice::PromiscReceiveCallback m_promiscCallback;  //!< Receive callback
++  std::list<NetDevice::PromiscReceiveCallback> m_promiscCallback;  //!< Receive callback
+                                                         //   (promisc data)
+   uint32_t m_ifIndex; //!< Index of the interface
+   bool m_linkUp;      //!< Identify if the link is up or not
+@@ -455,6 +464,10 @@
+    */
+   uint32_t m_mtu;
+ 
++  uint32_t m_emergentToken {0};
++  bool m_isDropBeforeTcpSeq {false};
++  SequenceNumber32 m_dropBeforeTcpSeq;
++
+   Ptr<Packet> m_currentPkt; //!< Current packet processed
+ 
+   /**
+diff -ruN ns-3.34/src/traffic-control/model/queue-disc.cc ns-3.34/src/traffic-control/model/queue-disc.cc
+--- ns-3.34/src/traffic-control/model/queue-disc.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/traffic-control/model/queue-disc.cc	2023-10-17 16:22:08.242909878 +0800
+@@ -1073,7 +1073,6 @@
+ QueueDisc::Transmit (Ptr<QueueDiscItem> item)
+ {
+   NS_LOG_FUNCTION (this << item);
+-
+   // if the device queue is stopped, requeue the packet and return false.
+   // Note that if the underlying device is tc-unaware, packets are never
+   // requeued because the queues of tc-unaware devices are never stopped
+diff -ruN ns-3.34/src/wifi/model/block-ack-manager.cc ns-3.34/src/wifi/model/block-ack-manager.cc
+--- ns-3.34/src/wifi/model/block-ack-manager.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/block-ack-manager.cc	2023-10-17 16:22:08.278909608 +0800
+@@ -455,6 +455,26 @@
+ }
+ 
+ void
++BlockAckManager::GetSeqNumPkt(Ptr<WifiMacQueueItem> pkt)
++{
++  Ptr<Packet> PktSeq = pkt->GetPacket()->Copy();
++  LlcSnapHeader llchdr;
++  PktSeq->RemoveHeader(llchdr);
++  Ipv4Header ipv4hdr = Ipv4Header();
++  PktSeq->RemoveHeader(ipv4hdr);
++  Ptr<Packet> PktToPush = pkt->GetPacket()->Copy();
++  if(ipv4hdr.GetProtocol() == 6){
++      m_PktList.push_back(PktToPush);
++  }
++}
++
++SequenceNumber32
++BlockAckManager::GetAckNum(void)
++{
++  return m_AckNumber;
++}
++
++void
+ BlockAckManager::NotifyGotBlockAck (const CtrlBAckResponseHeader& blockAck, Mac48Address recipient,
+                                     const std::set<uint8_t>& tids, double rxSnr, double dataSnr,
+                                     const WifiTxVector& dataTxVector, size_t index)
+@@ -499,6 +519,11 @@
+               for (PacketQueueI queueIt = it->second.second.begin (); queueIt != queueEnd; )
+                 {
+                   currentSeq = (*queueIt)->GetHeader ().GetSequenceNumber ();
++                  if((*queueIt)->GetHeader().IsData()){
++                  // std::cout<<"[pkt print block 1]"<<" "<<"time now: "<<Simulator::Now().GetMicroSeconds()<<" ";
++                  // (*queueIt)->GetPacket()->Print(std::cout);
++                  // std::cout<<" "<<m_AckNumber<<std::endl;
++                  GetSeqNumPkt((*queueIt));}
+                   if (blockAck.IsFragmentReceived (currentSeq,
+                                                     (*queueIt)->GetHeader ().GetFragmentNumber ()))
+                     {
+@@ -528,6 +553,11 @@
+               for (PacketQueueI queueIt = it->second.second.begin (); queueIt != queueEnd; )
+                 {
+                   currentSeq = (*queueIt)->GetHeader ().GetSequenceNumber ();
++                  if((*queueIt)->GetHeader().IsData()){
++                  // std::cout<<"[pkt print block 2]"<<" "<<"time now: "<<Simulator::Now().GetMicroSeconds()<<" ";
++                  // (*queueIt)->GetPacket()->Print(std::cout);
++                  // std::cout<<" "<<m_AckNumber<<std::endl;
++                  GetSeqNumPkt((*queueIt));}
+                   if (blockAck.IsPacketReceived (currentSeq, index))
+                     {
+                       it->second.first.NotifyAckedMpdu (*queueIt);
+diff -ruN ns-3.34/src/wifi/model/block-ack-manager.h ns-3.34/src/wifi/model/block-ack-manager.h
+--- ns-3.34/src/wifi/model/block-ack-manager.h	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/block-ack-manager.h	2023-10-17 16:22:08.278909608 +0800
+@@ -29,6 +29,9 @@
+ #include "block-ack-type.h"
+ #include "wifi-mac-queue-item.h"
+ #include "wifi-tx-vector.h"
++#include "ns3/llc-snap-header.h"
++#include "ns3/ipv4-header.h"
++#include "ns3/tcp-header.h"
+ 
+ namespace ns3 {
+ 
+@@ -431,6 +434,11 @@
+    */
+   void ScheduleBar (Ptr<const WifiMacQueueItem> bar, bool skipIfNoDataQueued = false);
+ 
++  void GetSeqNumPkt(Ptr<WifiMacQueueItem> pkt);
++  SequenceNumber32 GetAckNum(void);
++  SequenceNumber32 m_AckNumber;
++  std::list<Ptr<Packet>> m_PktList;
++
+ private:
+   /**
+    * Inactivity timeout function
+diff -ruN ns-3.34/src/wifi/model/frame-exchange-manager.cc ns-3.34/src/wifi/model/frame-exchange-manager.cc
+--- ns-3.34/src/wifi/model/frame-exchange-manager.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/frame-exchange-manager.cc	2023-10-17 16:22:08.278909608 +0800
+@@ -980,6 +980,20 @@
+ }
+ 
+ void
++FrameExchangeManager::GetSeqNumPkt(Ptr<WifiMacQueueItem> pkt)
++{
++  Ptr<Packet> PktSeq = pkt->GetPacket()->Copy();
++  LlcSnapHeader llchdr;
++  PktSeq->RemoveHeader(llchdr);
++  Ipv4Header ipv4hdr = Ipv4Header();
++  PktSeq->RemoveHeader(ipv4hdr);
++  Ptr<Packet> PktToPush = pkt->GetPacket()->Copy();
++  if(ipv4hdr.GetProtocol() == 6){
++      m_PacketList.push_back(PktToPush);
++  }
++}
++
++void
+ FrameExchangeManager::ReceiveMpdu (Ptr<WifiMacQueueItem> mpdu, RxSignalInfo rxSignalInfo,
+                                    const WifiTxVector& txVector, bool inAmpdu)
+ {
+@@ -1037,8 +1051,18 @@
+           NS_ASSERT (hdr.GetAddr1 () == m_self);
+           SnrTag tag;
+           mpdu->GetPacket ()->PeekPacketTag (tag);
++          if(m_mpdu->GetHeader().IsData()){
++            // std::cout<<"[pkt print frame]"<<" "<<"time now: "<<Simulator::Now().GetMicroSeconds()<<" ";
++            // m_mpdu->GetPacket()->Print(std::cout);           
++            GetSeqNumPkt(m_mpdu);
++            // std::cout<<" "<<m_AckNumber<<std::endl;
++          }
+           ReceivedNormalAck (m_mpdu, m_txParams.m_txVector, txVector, rxSignalInfo, tag.Get ());
+           m_mpdu = 0;
++          Time time_now = Simulator::Now();
++          this->receivet = time_now.GetMilliSeconds();
++
++          //this->receivet = time_now.GetMilliSeconds();
+         }
+     }
+   else if (hdr.IsMgt ())
+diff -ruN ns-3.34/src/wifi/model/frame-exchange-manager.h ns-3.34/src/wifi/model/frame-exchange-manager.h
+--- ns-3.34/src/wifi/model/frame-exchange-manager.h	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/frame-exchange-manager.h	2023-10-17 16:22:08.278909608 +0800
+@@ -35,7 +35,7 @@
+ #include "ns3/wifi-protection-manager.h"
+ #include "ns3/wifi-ack-manager.h"
+ #include "channel-access-manager.h"
+-
++#include <unordered_map>
+ namespace ns3 {
+ 
+ struct RxSignalInfo;
+@@ -58,7 +58,8 @@
+   static TypeId GetTypeId (void);
+   FrameExchangeManager ();
+   virtual ~FrameExchangeManager ();
+-
++  
++  int64_t receivet;
+   /**
+    * typedef for a callback to invoke when an MPDU is dropped.
+    */
+@@ -235,6 +236,10 @@
+    */
+   void NotifyOffNow (void);
+ 
++  void GetSeqNumPkt(Ptr<WifiMacQueueItem> pkt);
++  SequenceNumber32 m_AckNumber;
++  std::deque<Ptr<Packet>> m_PacketList;
++
+ protected:
+   void DoDispose () override;
+ 
+diff -ruN ns-3.34/src/wifi/model/ht/ht-frame-exchange-manager.cc ns-3.34/src/wifi/model/ht/ht-frame-exchange-manager.cc
+--- ns-3.34/src/wifi/model/ht/ht-frame-exchange-manager.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/ht/ht-frame-exchange-manager.cc	2023-10-17 16:22:08.282909578 +0800
+@@ -1335,7 +1335,9 @@
+         {
+           Mac48Address sender = hdr.GetAddr2 ();
+           NS_LOG_DEBUG ("Received BlockAck from=" << sender);
+-
++         
++          Time time_now = Simulator::Now();
++          this->receivet = time_now.GetMilliSeconds();
+           SnrTag tag;
+           mpdu->GetPacket ()->PeekPacketTag (tag);
+ 
+@@ -1345,7 +1347,10 @@
+           uint8_t tid = blockAck.GetTidInfo ();
+           GetBaManager (tid)->NotifyGotBlockAck (blockAck, hdr.GetAddr2 (), {tid}, rxSnr,
+                                                  tag.Get (), m_txParams.m_txVector);
+-
++          while(GetBaManager (tid)->m_PktList.size()>0){
++            m_PacketList.push_back(GetBaManager (tid)->m_PktList.front());
++            GetBaManager (tid)->m_PktList.pop_front();
++          }
+           // cancel the timer
+           m_txTimer.Cancel ();
+           m_channelAccessManager->NotifyAckTimeoutResetNow ();
+diff -ruN ns-3.34/src/wifi/model/qos-txop.cc ns-3.34/src/wifi/model/qos-txop.cc
+--- ns-3.34/src/wifi/model/qos-txop.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/qos-txop.cc	2023-10-17 16:22:08.286909549 +0800
+@@ -118,6 +118,29 @@
+   Txop::DoDispose ();
+ }
+ 
++Ptr<QosFrameExchangeManager> 
++QosTxop::GetFem (void)
++{
++  return m_qosFem;
++}
++
++uint32_t
++QosTxop::GetAvgIntervalTimeMs (void)
++{
++  if (!m_intervalTimeMs.empty()) {
++    return std::accumulate(m_intervalTimeMs.begin(), m_intervalTimeMs.end(), 0) / m_intervalTimeMs.size();
++  }
++  else {
++    return 0;
++  }
++}
++
++uint32_t
++QosTxop::GetCurSendTimeMs (void)
++{
++  return m_curSendTimeMs;
++}
++
+ void
+ QosTxop::SetQosQueueSize (Ptr<WifiMacQueueItem> mpdu)
+ {
+@@ -349,6 +372,18 @@
+           hdr.SetSequenceNumber (sequence);
+         }
+       NS_LOG_DEBUG ("Packet peeked from EDCA queue: " << **queueIt.it);
++
++
++      if (!(*queueIt.it)->GetHeader ().IsAction ()) {
++        int64_t rcvt = GetFem()->receivet;
++        if ((rcvt - m_curSendTimeMs) >= 0) {
++          m_intervalTimeMs.push_back(uint32_t(rcvt - m_curSendTimeMs));
++        }
++        while (m_intervalTimeMs.size() > 6) {
++          m_intervalTimeMs.pop_front();
++        }
++        m_curSendTimeMs = (uint32_t) Simulator::Now().GetMilliSeconds();  
++      }
+       return *queueIt.it;
+     }
+ 
+@@ -401,8 +436,8 @@
+                              GetBaBufferSize (recipient, tid)));
+       // A-MSDU aggregation cannot be done on a retransmitted MPDU, hence return
+       // the peeked MPDU
+-      NS_LOG_DEBUG ("Got MPDU from BA manager queue: " << *peekedItem);
+-
++      NS_LOG_DEBUG ("Got MPDU from BA manager queue: " << *peekedItem);    
++    
+       queueIt = peekedIt;
+       queueIt.it++;
+ 
+diff -ruN ns-3.34/src/wifi/model/qos-txop.h ns-3.34/src/wifi/model/qos-txop.h
+--- ns-3.34/src/wifi/model/qos-txop.h	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/qos-txop.h	2023-10-17 16:22:08.286909549 +0800
+@@ -27,6 +27,8 @@
+ #include "block-ack-manager.h"
+ #include "txop.h"
+ #include "qos-utils.h"
++#include <deque>
++#include <numeric>
+ 
+ namespace ns3 {
+ 
+@@ -82,7 +84,6 @@
+ 
+   QosTxop ();
+   virtual ~QosTxop ();
+-
+   bool IsQosTxop (void) const override;
+   AcIndex GetAccessCategory (void) const override;
+   void SetWifiRemoteStationManager (const Ptr<WifiRemoteStationManager> remoteManager) override;
+@@ -92,6 +93,10 @@
+   void NotifyChannelReleased (void) override;
+   void SetDroppedMpduCallback (DroppedMpdu callback) override;
+ 
++  uint32_t GetAvgIntervalTimeMs (void);
++
++  uint32_t GetCurSendTimeMs (void);
++
+   /**
+    * Set the Frame Exchange Manager associated with this QoS STA.
+    *
+@@ -388,6 +393,8 @@
+    */
+   virtual Time GetRemainingTxop (void) const;
+ 
++  Ptr<QosFrameExchangeManager> GetFem(void);
++
+ protected:
+   void DoDispose (void) override;
+ 
+@@ -423,6 +430,8 @@
+   bool m_useExplicitBarAfterMissedBlockAck;             //!< flag whether explicit BlockAckRequest should be sent upon missed BlockAck Response
+ 
+   TracedCallback<Time, Time> m_txopTrace; //!< TXOP trace callback
++  std::deque<uint32_t> m_intervalTimeMs;
++  uint32_t m_curSendTimeMs;
+ };
+ 
+ } //namespace ns3
+diff -ruN ns-3.34/src/wifi/model/wifi-mac-header.cc ns-3.34/src/wifi/model/wifi-mac-header.cc
+--- ns-3.34/src/wifi/model/wifi-mac-header.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/wifi-mac-header.cc	2023-10-17 16:22:08.290909518 +0800
+@@ -1061,6 +1061,7 @@
+ WifiMacHeader::Print (std::ostream &os) const
+ {
+   os << GetTypeString () << " ";
++  os << "[debug] dst, src: " << m_addr1 << " " << m_addr2 << " ";
+   switch (GetType ())
+     {
+     case WIFI_MAC_CTL_RTS:
+diff -ruN ns-3.34/src/wifi/model/wifi-mac-queue.cc ns-3.34/src/wifi/model/wifi-mac-queue.cc
+--- ns-3.34/src/wifi/model/wifi-mac-queue.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/wifi-mac-queue.cc	2023-10-17 16:22:08.290909518 +0800
+@@ -110,7 +110,10 @@
+ bool
+ WifiMacQueue::Enqueue (Ptr<WifiMacQueueItem> item)
+ {
+-  NS_LOG_FUNCTION (this << *item);
++  //NS_LOG_FUNCTION (this << *item);
++  // NS_LOG_FUNCTION ("time:"<< Simulator::Now().GetMicroSeconds() <<" " << *item);
++  // NS_LOG_FUNCTION ("packet len:  " << QueueBase::GetNPackets ());
++  // NS_LOG_FUNCTION ("byte:  " << QueueBase::GetNBytes ());
+ 
+   return Insert (end (), item);
+ }
+@@ -129,7 +132,13 @@
+   NS_LOG_FUNCTION (this << *item);
+   NS_ASSERT_MSG (GetMaxSize ().GetUnit () == QueueSizeUnit::PACKETS,
+                  "WifiMacQueues must be in packet mode");
+-
++  // std::cout<<"insert"<<*item<<std::endl;
++  // std::cout<<"queue"<<std::endl;
++  // for (auto it = begin(); it != end(); it++){
++  //     Ptr<WifiMacQueueItem> em = *it;
++  //     std::cout<<*em<<std::endl;
++  // }
++  // std::cout<<"TOTAL"<<QueueBase::GetTotalReceivedPackets()<<std::endl;
+   // insert the item if the queue is not full
+   if (QueueBase::GetNPackets () < GetMaxSize ().GetValue ())
+     {
+@@ -166,7 +175,7 @@
+           DoRemove (begin ());
+         }
+     }
+-
++  std::cout<<"TOTAL"<<QueueBase::GetTotalReceivedPackets()<<std::endl;
+   return DoEnqueue (pos, item);
+ }
+ 
+@@ -177,10 +186,11 @@
+   for (ConstIterator it = begin (); it != end (); )
+     {
+       if (!TtlExceeded (it))
+-        {
++        { 
+           return DoDequeue (it);
+         }
+     }
++
+   NS_LOG_DEBUG ("The queue is empty");
+   return 0;
+ }
+@@ -216,7 +226,7 @@
+ {
+   NS_LOG_FUNCTION (this << +tid << dest);
+   ConstIterator it = PeekByTidAndAddress (tid, dest);
+-
++  
+   if (it == end ())
+     {
+       return 0;
+@@ -248,7 +258,7 @@
+         {
+           NS_LOG_DEBUG ("Packet lifetime expired");
+           return 0;
+-        }
++        } 
+       return DoDequeue (pos);
+     }
+ 
+@@ -265,6 +275,10 @@
+             {
+               return 0;
+             }
++          // this->time_list.push_back(Simulator::Now().GetMilliSeconds());
++          // while (this->time_list.size() > 6) {
++          //  this->time_list.pop_front();
++          // }  
+           return DoDequeue (it);
+         }
+       else if (!TtlExceeded (it))
+@@ -295,6 +309,19 @@
+   return 0;
+ }
+ 
++Ptr<const WifiMacQueueItem>
++WifiMacQueue::MyPeek (uint32_t pos) const
++{
++  NS_LOG_FUNCTION (this);
++  uint32_t cur = 0;
++  auto it = begin();
++  while (cur < pos && it != end()) {
++    it++;
++    cur++;
++  }
++  return DoPeek(it);
++}
++
+ WifiMacQueue::ConstIterator
+ WifiMacQueue::PeekByAddress (Mac48Address dest, ConstIterator pos) const
+ {
+@@ -410,7 +437,6 @@
+ WifiMacQueue::Remove (void)
+ {
+   NS_LOG_FUNCTION (this);
+-
+   for (ConstIterator it = begin (); it != end (); )
+     {
+       if (!TtlExceeded (it))
+@@ -557,6 +583,11 @@
+ WifiMacQueue::GetNBytes (void)
+ {
+   NS_LOG_FUNCTION (this);
++  //std::cout<<"Nbyte function:"<<std::endl;
++  // for (auto it = begin(); it != end(); it++){
++  //     Ptr<WifiMacQueueItem> em = *it;
++  //     std::cout<<*em<<std::endl;
++  // }
+   // remove packets that stayed in the queue for too long
+   for (ConstIterator it = begin (); it != end (); )
+     {
+diff -ruN ns-3.34/src/wifi/model/wifi-mac-queue.h ns-3.34/src/wifi/model/wifi-mac-queue.h
+--- ns-3.34/src/wifi/model/wifi-mac-queue.h	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/wifi-mac-queue.h	2023-10-17 16:22:08.290909518 +0800
+@@ -195,6 +195,12 @@
+    *
+    * \return an iterator pointing to the peeked packet
+    */
++  Ptr<const WifiMacQueueItem> MyPeek (uint32_t pos) const;
++  /**
++   * Peek the packet in any position of the queue. The packet is not removed.
++   *
++   * \return the packet
++   */
+   ConstIterator PeekByAddress (Mac48Address dest, ConstIterator pos = EMPTY) const;
+   /**
+    * Search and return, if present in the queue, the first packet having the
+@@ -328,7 +334,8 @@
+   uint32_t GetNBytes (void);
+ 
+   static const ConstIterator EMPTY;         //!< Invalid iterator to signal an empty queue
+-
++    //dequeue timestamp
++  //std::deque<int64_t> time_list;
+ 
+ private:
+   /**
+diff -ruN ns-3.34/src/wifi/model/wifi-mac-queue-item.cc ns-3.34/src/wifi/model/wifi-mac-queue-item.cc
+--- ns-3.34/src/wifi/model/wifi-mac-queue-item.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/wifi-mac-queue-item.cc	2023-10-17 16:22:08.290909518 +0800
+@@ -23,6 +23,8 @@
+ 
+ #include "ns3/simulator.h"
+ #include "ns3/packet.h"
++#include "ns3/ipv4-header.h"
++#include "ns3/ppp-header.h"
+ #include "ns3/log.h"
+ #include "wifi-mac-queue-item.h"
+ #include "wifi-mac-trailer.h"
+@@ -228,6 +230,7 @@
+ void
+ WifiMacQueueItem::Print (std::ostream& os) const
+ {
++  m_packet->Print(std::cout);
+   os << m_header.GetTypeString ()
+      << ", payloadSize=" << GetPacketSize ()
+      << ", to=" << m_header.GetAddr1 ()
+@@ -255,6 +258,7 @@
+ 
+ std::ostream & operator << (std::ostream &os, const WifiMacQueueItem &item)
+ {
++  std::cout<<"item print"<<std::endl;
+   item.Print (os);
+   return os;
+ }
+diff -ruN ns-3.34/src/wifi/model/yans-wifi-channel.cc ns-3.34/src/wifi/model/yans-wifi-channel.cc
+--- ns-3.34/src/wifi/model/yans-wifi-channel.cc	2021-07-15 01:31:07.000000000 +0800
++++ ns-3.34/src/wifi/model/yans-wifi-channel.cc	2023-10-17 16:22:08.294909489 +0800
+@@ -85,7 +85,8 @@
+ void
+ YansWifiChannel::Send (Ptr<YansWifiPhy> sender, Ptr<const WifiPpdu> ppdu, double txPowerDbm) const
+ {
+-  NS_LOG_FUNCTION (this << sender << ppdu << txPowerDbm);
++  NS_LOG_FUNCTION (sender->GetDevice () ->GetNode ()->GetId ()<<sender << ppdu << txPowerDbm);
++  
+   Ptr<MobilityModel> senderMobility = sender->GetMobility ();
+   NS_ASSERT (senderMobility != 0);
+   for (PhyList::const_iterator i = m_phyList.begin (); i != m_phyList.end (); i++)
+@@ -125,7 +126,7 @@
+ void
+ YansWifiChannel::Receive (Ptr<YansWifiPhy> phy, Ptr<WifiPpdu> ppdu, double rxPowerDbm)
+ {
+-  NS_LOG_FUNCTION (phy << ppdu << rxPowerDbm);
++  NS_LOG_FUNCTION ("node:"<< phy->GetDevice () ->GetNode ()->GetId ()<< phy << ppdu << rxPowerDbm);
+   // Do no further processing if signal is too weak
+   // Current implementation assumes constant RX power over the PPDU duration
+   if ((rxPowerDbm + phy->GetRxGain ()) < phy->GetRxSensitivity ())
